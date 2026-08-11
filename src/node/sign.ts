@@ -13,6 +13,9 @@ import type { McpbSignatureInfoSchema } from "../shared/common.js";
 const SIGNATURE_HEADER = "MCPB_SIG_V1";
 const SIGNATURE_FOOTER = "MCPB_SIG_END";
 
+// Guard against a pathological signature block length that never stabilizes
+const MAX_SIGNATURE_LENGTH_ATTEMPTS = 4;
+
 const execFileAsync = promisify(execFile);
 
 /**
@@ -41,69 +44,100 @@ export function signMcpbFile(
     readFileSync(path, "utf-8"),
   );
 
-  // Create PKCS#7 signed data
-  const p7 = forge.pkcs7.createSignedData();
-  p7.content = forge.util.createBuffer(mcpbContent);
+  // Builds a detached PKCS#7 signature block covering exactly `content`
+  const buildSignatureBlock = (content: Buffer): Buffer => {
+    // Create PKCS#7 signed data
+    const p7 = forge.pkcs7.createSignedData();
+    p7.content = forge.util.createBuffer(content);
 
-  // Parse and add certificates
-  const signingCert = forge.pki.certificateFromPem(certificatePem);
-  const privateKey = forge.pki.privateKeyFromPem(privateKeyPem);
+    // Parse and add certificates
+    const signingCert = forge.pki.certificateFromPem(certificatePem);
+    const privateKey = forge.pki.privateKeyFromPem(privateKeyPem);
 
-  p7.addCertificate(signingCert);
+    p7.addCertificate(signingCert);
 
-  // Add intermediate certificates
-  if (intermediatePems) {
-    for (const pem of intermediatePems) {
-      p7.addCertificate(forge.pki.certificateFromPem(pem));
+    // Add intermediate certificates
+    if (intermediatePems) {
+      for (const pem of intermediatePems) {
+        p7.addCertificate(forge.pki.certificateFromPem(pem));
+      }
     }
-  }
 
-  // Add signer
-  p7.addSigner({
-    key: privateKey,
-    certificate: signingCert,
-    digestAlgorithm: forge.pki.oids.sha256,
-    authenticatedAttributes: [
-      {
-        type: forge.pki.oids.contentType,
-        value: forge.pki.oids.data,
-      },
-      {
-        type: forge.pki.oids.messageDigest,
-        // Value will be auto-populated
-      },
-      {
-        type: forge.pki.oids.signingTime,
-        // Value will be auto-populated with current time
-      },
-    ],
-  });
+    // Add signer
+    p7.addSigner({
+      key: privateKey,
+      certificate: signingCert,
+      digestAlgorithm: forge.pki.oids.sha256,
+      authenticatedAttributes: [
+        {
+          type: forge.pki.oids.contentType,
+          value: forge.pki.oids.data,
+        },
+        {
+          type: forge.pki.oids.messageDigest,
+          // Value will be auto-populated
+        },
+        {
+          type: forge.pki.oids.signingTime,
+          // Value will be auto-populated with current time
+        },
+      ],
+    });
 
-  // Sign with detached signature
-  p7.sign({ detached: true });
+    // Sign with detached signature
+    p7.sign({ detached: true });
 
-  // Convert to DER format
-  const asn1 = forge.asn1.toDer(p7.toAsn1());
-  const pkcs7Signature = Buffer.from(asn1.getBytes(), "binary");
+    // Convert to DER format
+    const asn1 = forge.asn1.toDer(p7.toAsn1());
+    const pkcs7Signature = Buffer.from(asn1.getBytes(), "binary");
 
-  // Create signature block with PKCS#7 data
-  const signatureBlock = createSignatureBlock(pkcs7Signature);
+    // Create signature block with PKCS#7 data
+    return createSignatureBlock(pkcs7Signature);
+  };
 
-  // Update ZIP EOCD comment_length to include signature block
-  // This ensures strict ZIP parsers accept the signed file
-  const updatedContent = Buffer.from(mcpbContent);
-  const eocdOffset = findEocdOffset(updatedContent);
-  if (eocdOffset !== -1) {
-    const currentCommentLength = updatedContent.readUInt16LE(eocdOffset + 20);
-    updatedContent.writeUInt16LE(
-      currentCommentLength + signatureBlock.length,
-      eocdOffset + 20,
-    );
+  // Returns a copy of `content` whose ZIP EOCD comment_length has been grown by
+  // `extra` bytes, so strict ZIP parsers accept the appended signature block
+  const withEocdCommentLength = (content: Buffer, extra: number): Buffer => {
+    const patched = Buffer.from(content);
+    const eocdOffset = findEocdOffset(patched);
+    if (eocdOffset === -1) {
+      return patched;
+    }
+    const commentLength = patched.readUInt16LE(eocdOffset + 20) + extra;
+    if (commentLength > 0xffff) {
+      throw new Error(
+        `Signature block does not fit in the ZIP comment field (${commentLength} > 65535 bytes)`,
+      );
+    }
+    patched.writeUInt16LE(commentLength, eocdOffset + 20);
+    return patched;
+  };
+
+  // The EOCD comment_length must already hold its final value at the moment the
+  // content is signed. Signing first and patching afterwards would bind the
+  // digest to bytes that never reach disk, so every standards-compliant verifier
+  // would report a digest failure. The comment_length depends on the signature
+  // block length and the signature covers the patched bytes, so the two are
+  // mutually dependent -- iterate until the block length stops changing.
+  let blockLength = buildSignatureBlock(mcpbContent).length;
+  let signedContent: Buffer;
+  let signatureBlock: Buffer;
+  for (let attempt = 0; ; attempt++) {
+    signedContent = withEocdCommentLength(mcpbContent, blockLength);
+    signatureBlock = buildSignatureBlock(signedContent);
+    if (signatureBlock.length === blockLength) {
+      break;
+    }
+    if (attempt >= MAX_SIGNATURE_LENGTH_ATTEMPTS) {
+      throw new Error(
+        "Signature block length did not converge while signing MCPB file",
+      );
+    }
+    blockLength = signatureBlock.length;
   }
 
   // Append signature block to MCPB file
-  const signedContent = Buffer.concat([updatedContent, signatureBlock]);
-  writeFileSync(mcpbPath, signedContent);
+  writeFileSync(mcpbPath, Buffer.concat([signedContent, signatureBlock]));
 }
 
 /**
