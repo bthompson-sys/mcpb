@@ -9,11 +9,13 @@
  * 5. Tests various failure scenarios
  */
 
+import { createHash } from "crypto";
 import * as fs from "fs";
 import forge from "node-forge";
 import * as path from "path";
 
 import {
+  extractSignatureBlock,
   signMcpbFile,
   unsignMcpbFile,
   verifyMcpbFile,
@@ -467,6 +469,62 @@ describe("MCPB Signing E2E Tests", () => {
 
   it("should remove signatures", async () => {
     await testSignatureRemoval();
+  });
+
+  it("should bind the signature digest to the bytes actually written to disk", async () => {
+    const testFile = path.join(TEST_DIR, "test-digest-binding.mcpb");
+    fs.copyFileSync(TEST_MCPB, testFile);
+
+    const preSigningContent = fs.readFileSync(testFile);
+    signMcpbFile(testFile, SELF_SIGNED_CERT, SELF_SIGNED_KEY);
+
+    // Split the signed file the same way verifyMcpbFile does: everything before
+    // the signature header is the content the detached signature must cover.
+    const signedFile = fs.readFileSync(testFile);
+    const { originalContent, pkcs7Signature } =
+      extractSignatureBlock(signedFile);
+    expect(pkcs7Signature).toBeDefined();
+
+    // Pull the messageDigest authenticated attribute out of the PKCS#7 blob
+    const p7 = forge.pkcs7.messageFromAsn1(
+      forge.asn1.fromDer(pkcs7Signature!.toString("binary")),
+    ) as unknown as {
+      rawCapture: {
+        authenticatedAttributes: Array<{
+          value: [{ value: string }, { value: [{ value: string }] }];
+        }>;
+      };
+    };
+
+    let messageDigest: string | null = null;
+    for (const attr of p7.rawCapture.authenticatedAttributes || []) {
+      if (
+        forge.asn1.derToOid(attr.value[0].value) ===
+        forge.pki.oids.messageDigest
+      ) {
+        messageDigest = Buffer.from(
+          attr.value[1].value[0].value,
+          "binary",
+        ).toString("hex");
+        break;
+      }
+    }
+    expect(messageDigest).not.toBeNull();
+
+    const digestOf = (buf: Buffer) =>
+      createHash("sha256").update(buf).digest("hex");
+
+    // The signature must cover the on-disk pre-signature bytes. Signing before
+    // patching the EOCD comment_length binds the digest to the pre-patch bytes
+    // instead, which no standards-compliant verifier would accept.
+    expect(messageDigest).toBe(digestOf(originalContent));
+
+    // Sanity check that this assertion has teeth: the EOCD patch really did
+    // change the content, so the two candidate digests are genuinely different.
+    expect(originalContent.equals(preSigningContent)).toBe(false);
+    expect(messageDigest).not.toBe(digestOf(preSigningContent));
+
+    fs.unlinkSync(testFile);
   });
 
   it("should update EOCD comment_length after signing", async () => {
